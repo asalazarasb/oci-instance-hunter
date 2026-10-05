@@ -2,9 +2,8 @@ name: OCI A1 Capacity Hunter
 
 on:
   schedule:
-    # Se ejecuta automáticamente cada 15 minutos en los servidores de GitHub
     - cron: '*/15 * * * *'
-  workflow_dispatch: # Permite dispararlo manualmente cuando quieras desde la web
+  workflow_dispatch:
 
 jobs:
   hunt:
@@ -28,32 +27,42 @@ jobs:
           fingerprint=${{ secrets.OCI_FINGERPRINT }}
           tenancy=${{ secrets.OCI_TENANCY_OCID }}
           region=${{ secrets.OCI_REGION }}
-          key_file=~/.oci/oci_api_key.pem
+          key_file=/home/runner/.oci/oci_api_key.pem
           EOF
+
+      - name: Validar conexion con OCI
+        run: |
+          echo "Comprobando autenticacion con OCI..."
+          oci iam compartment get --compartment-id "${{ secrets.OCI_TENANCY_OCID }}" --output table
 
       - name: Reintentar despliegue del Stack
         env:
           STACK_ID: ${{ secrets.OCI_STACK_ID }}
         run: |
-          # Intentar hasta 10 veces por ejecución de workflow
+          set +e # Evita que el runner aborte ante errores de comando
+          
           for i in {1..10}; do
-            echo "[Intento $i] Creando Apply Job para ale-server-oci..."
+            echo "=============================================="
+            echo "[Intento $i] Creando Apply Job para el Stack..."
             
-            JOB_ID=$(oci resource-manager job create-apply-job \
+            OUTPUT=$(oci resource-manager job create-apply-job \
               --stack-id "$STACK_ID" \
               --execution-plan-strategy "AUTO_APPROVED" \
-              --display-name "gh-action-retry-$(date +%s)" \
-              --query "data.id" --raw-output 2>&1)
+              --display-name "gh-action-retry-$(date +%s)" 2>&1)
             
-            if [[ "$JOB_ID" != ocid1.ormjob* ]]; then
-              echo "Error al invocar API: $JOB_ID"
+            echo "Respuesta del comando:"
+            echo "$OUTPUT"
+            
+            JOB_ID=$(echo "$OUTPUT" | grep -o 'ocid1.ormjob.oc1.[^" ]*' | head -n 1)
+
+            if [ -z "$JOB_ID" ]; then
+              echo "No se pudo obtener el Job ID. Revisa la salida superior."
               sleep 20
               continue
             fi
 
-            echo "Job ID: $JOB_ID. Esperando estado..."
+            echo "Job ID detectado: $JOB_ID. Monitoreando ejecucion..."
             
-            # Monitoreo del Job
             while true; do
               STATUS=$(oci resource-manager job get --job-id "$JOB_ID" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null)
               if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "CANCELED" ]]; then
@@ -62,15 +71,15 @@ jobs:
               sleep 5
             done
 
-            echo "Resultado del job: $STATUS"
+            echo "Resultado final del job: $STATUS"
 
             if [ "$STATUS" == "SUCCEEDED" ]; then
-              echo "¡Instancia creada exitosamente!"
+              echo "¡Instancia creada con exito!"
               exit 0
             fi
 
-            echo "Sin capacidad disponible. Esperando 30 segundos antes del siguiente intento..."
+            echo "Sin capacidad o fallo en apply. Esperando 30 segundos..."
             sleep 30
           done
           
-          echo "Fin de la ventana de intentos. El siguiente cron lo retomará."
+          echo "Fin de la tanda de reintentos."
