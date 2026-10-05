@@ -1,0 +1,76 @@
+name: OCI A1 Capacity Hunter
+
+on:
+  schedule:
+    # Se ejecuta automáticamente cada 15 minutos en los servidores de GitHub
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # Permite dispararlo manualmente cuando quieras desde la web
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Instalar OCI CLI
+        run: |
+          bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults
+          echo "/home/runner/bin" >> $GITHUB_PATH
+
+      - name: Configurar credenciales OCI
+        env:
+          OCI_KEY: ${{ secrets.OCI_KEY_FILE }}
+        run: |
+          mkdir -p ~/.oci
+          echo "$OCI_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat <<EOF > ~/.oci/config
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+
+      - name: Reintentar despliegue del Stack
+        env:
+          STACK_ID: ${{ secrets.OCI_STACK_ID }}
+        run: |
+          # Intentar hasta 10 veces por ejecución de workflow
+          for i in {1..10}; do
+            echo "[Intento $i] Creando Apply Job para ale-server-oci..."
+            
+            JOB_ID=$(oci resource-manager job create-apply-job \
+              --stack-id "$STACK_ID" \
+              --execution-plan-strategy "AUTO_APPROVED" \
+              --display-name "gh-action-retry-$(date +%s)" \
+              --query "data.id" --raw-output 2>&1)
+            
+            if [[ "$JOB_ID" != ocid1.ormjob* ]]; then
+              echo "Error al invocar API: $JOB_ID"
+              sleep 20
+              continue
+            fi
+
+            echo "Job ID: $JOB_ID. Esperando estado..."
+            
+            # Monitoreo del Job
+            while true; do
+              STATUS=$(oci resource-manager job get --job-id "$JOB_ID" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null)
+              if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "CANCELED" ]]; then
+                break
+              fi
+              sleep 5
+            done
+
+            echo "Resultado del job: $STATUS"
+
+            if [ "$STATUS" == "SUCCEEDED" ]; then
+              echo "¡Instancia creada exitosamente!"
+              exit 0
+            fi
+
+            echo "Sin capacidad disponible. Esperando 30 segundos antes del siguiente intento..."
+            sleep 30
+          done
+          
+          echo "Fin de la ventana de intentos. El siguiente cron lo retomará."
