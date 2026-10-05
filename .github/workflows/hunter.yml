@@ -8,6 +8,15 @@ on:
 jobs:
   hunt:
     runs-on: ubuntu-latest
+    env:
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_KEY_FILE: ${{ secrets.OCI_KEY_FILE }}
+      OCI_STACK_ID: ${{ secrets.OCI_STACK_ID }}
+      SUPPRESS_LABEL_WARNING: "True"
+
     steps:
       - name: Instalar OCI CLI
         run: |
@@ -15,38 +24,38 @@ jobs:
           echo "/home/runner/bin" >> $GITHUB_PATH
 
       - name: Configurar credenciales OCI
-        env:
-          OCI_KEY: ${{ secrets.OCI_KEY_FILE }}
         run: |
           mkdir -p ~/.oci
-          echo "$OCI_KEY" > ~/.oci/oci_api_key.pem
+          echo "$OCI_KEY_FILE" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
           cat <<EOF > ~/.oci/config
           [DEFAULT]
-          user=${{ secrets.OCI_USER_OCID }}
-          fingerprint=${{ secrets.OCI_FINGERPRINT }}
-          tenancy=${{ secrets.OCI_TENANCY_OCID }}
-          region=${{ secrets.OCI_REGION }}
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
           key_file=/home/runner/.oci/oci_api_key.pem
           EOF
 
       - name: Validar conexion con OCI
         run: |
           echo "Comprobando autenticacion con OCI..."
-          oci iam compartment get --compartment-id "${{ secrets.OCI_TENANCY_OCID }}" --output table
+          if [ -z "$OCI_TENANCY_OCID" ]; then
+            echo "ERROR: La variable OCI_TENANCY_OCID está vacía. Verifica el nombre exacto en los Secrets del repositorio."
+            exit 1
+          fi
+          oci iam compartment get --compartment-id "$OCI_TENANCY_OCID" --output table
 
       - name: Reintentar despliegue del Stack
-        env:
-          STACK_ID: ${{ secrets.OCI_STACK_ID }}
         run: |
-          set +e # Evita que el runner aborte ante errores de comando
+          set +e
           
           for i in {1..10}; do
             echo "=============================================="
             echo "[Intento $i] Creando Apply Job para el Stack..."
             
             OUTPUT=$(oci resource-manager job create-apply-job \
-              --stack-id "$STACK_ID" \
+              --stack-id "$OCI_STACK_ID" \
               --execution-plan-strategy "AUTO_APPROVED" \
               --display-name "gh-action-retry-$(date +%s)" 2>&1)
             
