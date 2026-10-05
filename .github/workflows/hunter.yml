@@ -2,13 +2,15 @@ name: OCI A1 Capacity Hunter
 
 on:
   schedule:
-    # Se ejecuta cada 30 minutos para respetar el rate limit de Resource Manager
     - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
   hunt:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
     env:
       OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
       OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
@@ -42,14 +44,14 @@ jobs:
 
       - name: Validar conexion con OCI
         run: |
-          echo "Comprobando autenticacion con OCI..."
           oci iam compartment get --compartment-id "$OCI_TENANCY_OCID" --output table
 
       - name: Reintentar despliegue del Stack
+        id: deploy
         run: |
           set +e
+          SUCCESS="false"
           
-          # 5 intentos por corrida espaciados por 90s (ventana total de ~7.5 minutos)
           for i in {1..5}; do
             echo "=============================================="
             echo "[Intento $i/5] Creando Apply Job para el Stack..."
@@ -59,18 +61,15 @@ jobs:
               --execution-plan-strategy "AUTO_APPROVED" \
               --display-name "gh-action-retry-$(date +%s)" 2>&1)
             
-            echo "Respuesta del comando:"
-            echo "$OUTPUT"
-            
             JOB_ID=$(echo "$OUTPUT" | grep -o 'ocid1.ormjob.oc1.[^" ]*' | head -n 1)
 
             if [ -z "$JOB_ID" ]; then
-              echo "Aviso: No se generó Job ID (posible rate limit 429). Esperando 90 segundos..."
+              echo "Aviso: No se generó Job ID. Esperando 90 segundos..."
               sleep 90
               continue
             fi
 
-            echo "Job ID detectado: $JOB_ID. Monitoreando ejecucion..."
+            echo "Job ID detectado: $JOB_ID. Monitoreando..."
             
             while true; do
               STATUS=$(oci resource-manager job get --job-id "$JOB_ID" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null)
@@ -84,11 +83,25 @@ jobs:
 
             if [ "$STATUS" == "SUCCEEDED" ]; then
               echo "¡Instancia creada con exito!"
+              SUCCESS="true"
+              echo "status=success" >> $GITHUB_OUTPUT
               exit 0
             fi
 
-            echo "Sin capacidad o fallo en apply. Esperando 90 segundos..."
+            echo "Sin capacidad. Esperando 90 segundos..."
             sleep 90
           done
           
-          echo "Fin de la tanda. La proxima ejecucion programada retomara el proceso."
+          echo "status=retry" >> $GITHUB_OUTPUT
+
+      - name: Re-lanzar workflow inmediatamente si aún no hay capacidad
+        if: steps.deploy.outputs.status != 'success'
+        run: |
+          echo "Esperando 2 minutos de enfriamiento antes de encadenar la siguiente ejecucion..."
+          sleep 120
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/hunter.yml/dispatches \
+            -d '{"ref":"main"}'
+          echo "Siguiente corrida encolada exitosamente."
