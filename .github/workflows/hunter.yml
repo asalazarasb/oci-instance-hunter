@@ -1,76 +1,131 @@
-- name: Reintentar despliegue del Stack
-  id: deploy
-  run: |
-    set +e
+name: OCI A1 Capacity Hunter
 
-    for i in {1..3}; do
-      echo "[Intento $i/3] Creando Apply Job para el Stack..."
+on:
+  schedule:
+    - cron: '0 * * * *'   # red de seguridad por si la cadena se corta
+  workflow_dispatch:
 
-      OUTPUT=$(oci resource-manager job create-apply-job \
-        --stack-id "$OCI_STACK_ID" \
-        --execution-plan-strategy "AUTO_APPROVED" \
-        --display-name "gh-action-retry-$(date +%s)" 2>&1)
+# Una sola corrida a la vez; las nuevas quedan en cola en vez de chocar en el Stack
+concurrency:
+  group: oci-hunter
+  cancel-in-progress: false
 
-      JOB_ID=$(echo "$OUTPUT" | grep -o 'ocid1.ormjob.oc1.[^" ]*' | head -n 1)
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      actions: write
+      contents: read
+    env:
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_KEY_FILE: ${{ secrets.OCI_KEY_FILE }}
+      OCI_STACK_ID: ${{ secrets.OCI_STACK_ID }}
+      SUPPRESS_LABEL_WARNING: "True"
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
 
-      if [ -z "$JOB_ID" ]; then
-        if echo "$OUTPUT" | grep -qiE '429|TooManyRequests'; then
-          ESPERA=$((300 * i))   # 5, 10 y 15 minutos
-          echo "OCI pide bajar el ritmo (429). Esperando $ESPERA segundos..."
-          sleep $ESPERA
-        elif echo "$OUTPUT" | grep -qiE '409|Conflict|in progress'; then
-          echo "Ya hay un job activo en el Stack. Esperando 120 segundos..."
-          sleep 120
-        else
-          echo "Aviso: OCI no creo el job. Respuesta:"
-          echo "$OUTPUT" | tail -n 20
-          sleep 120
-        fi
-        continue
-      fi
+    steps:
+      - name: Instalar OCI CLI
+        run: |
+          pip install --quiet oci-cli
+          oci --version
 
-      echo "Job ID: $JOB_ID. Monitoreando..."
-      STATUS=""
-      for t in {1..24}; do   # cada 30 s, maximo 12 minutos
-        STATUS=$(oci resource-manager job get --job-id "$JOB_ID" \
-          --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
-        if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "CANCELED" ]]; then
-          break
-        fi
-        sleep 30
-      done
+      - name: Configurar credenciales OCI
+        run: |
+          mkdir -p ~/.oci
+          echo "$OCI_KEY_FILE" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat <<EOF > ~/.oci/config
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=/home/runner/.oci/oci_api_key.pem
+          EOF
+          chmod 600 ~/.oci/config
 
-      echo "Resultado final del job: $STATUS"
-      if [ "$STATUS" == "SUCCEEDED" ]; then
-        echo "Instancia creada con exito!"
-        echo "status=success" >> "$GITHUB_OUTPUT"
-        exit 0
-      fi
+      - name: Validar conexion con OCI
+        run: |
+          oci iam compartment get --compartment-id "$OCI_TENANCY_OCID" --query 'data.name' --raw-output
 
-      LOGS=$(oci resource-manager job get-job-logs --job-id "$JOB_ID" --all \
-        --query 'data[].message' --raw-output 2>/dev/null)
+      - name: Reintentar despliegue del Stack
+        id: deploy
+        run: |
+          set +e
 
-      if echo "$LOGS" | grep -qiE 'out of (host )?capacity|capacity'; then
-        echo "Sin capacidad. Esperando 180 segundos..."
-        sleep 180
-        continue
-      fi
+          for i in {1..3}; do
+            echo "[Intento $i/3] Creando Apply Job para el Stack..."
 
-      echo "El job fallo por otra razon (no es capacidad). Ultimas lineas:"
-      echo "$LOGS" | tail -n 20
-      echo "status=error" >> "$GITHUB_OUTPUT"
-      exit 1
-    done
+            OUTPUT=$(oci resource-manager job create-apply-job \
+              --stack-id "$OCI_STACK_ID" \
+              --execution-plan-strategy "AUTO_APPROVED" \
+              --display-name "gh-action-retry-$(date +%s)" 2>&1)
 
-    echo "status=retry" >> "$GITHUB_OUTPUT"
+            JOB_ID=$(echo "$OUTPUT" | grep -o 'ocid1.ormjob.oc1.[^" ]*' | head -n 1)
 
-- name: Re-lanzar workflow si aun no hay capacidad
-  if: steps.deploy.outputs.status == 'retry'
-  run: |
-    echo "Esperando 10 minutos antes de encadenar la siguiente ejecucion..."
-    sleep 600
-    curl --fail -sS -X POST \
-      -H "Accept: application/vnd.github+json" \
-      -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-      https://api.github.com/repos/${{ github.repository }}/actions/workflows/hunter.yml/dispatches \
-      -d '{"ref":"main"}'
+            if [ -z "$JOB_ID" ]; then
+              if echo "$OUTPUT" | grep -qiE '429|TooManyRequests'; then
+                ESPERA=$((300 * i))   # 5, 10 y 15 minutos
+                echo "OCI pide bajar el ritmo (429). Esperando $ESPERA segundos..."
+                sleep $ESPERA
+              elif echo "$OUTPUT" | grep -qiE '409|Conflict|in progress'; then
+                echo "Ya hay un job activo en el Stack. Esperando 120 segundos..."
+                sleep 120
+              else
+                echo "Aviso: OCI no creo el job. Respuesta:"
+                echo "$OUTPUT" | tail -n 20
+                sleep 120
+              fi
+              continue
+            fi
+
+            echo "Job ID: $JOB_ID. Monitoreando..."
+            STATUS=""
+            for t in {1..24}; do   # cada 30 s, maximo 12 minutos
+              STATUS=$(oci resource-manager job get --job-id "$JOB_ID" \
+                --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
+              if [[ "$STATUS" == "SUCCEEDED" || "$STATUS" == "FAILED" || "$STATUS" == "CANCELED" ]]; then
+                break
+              fi
+              sleep 30
+            done
+
+            echo "Resultado final del job: $STATUS"
+            if [ "$STATUS" == "SUCCEEDED" ]; then
+              echo "Instancia creada con exito!"
+              echo "status=success" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            LOGS=$(oci resource-manager job get-job-logs --job-id "$JOB_ID" --all \
+              --query 'data[].message' --raw-output 2>/dev/null)
+
+            if echo "$LOGS" | grep -qiE 'out of (host )?capacity|capacity'; then
+              echo "Sin capacidad. Esperando 180 segundos..."
+              sleep 180
+              continue
+            fi
+
+            echo "El job fallo por otra razon (no es capacidad). Ultimas lineas:"
+            echo "$LOGS" | tail -n 20
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            exit 1
+          done
+
+          echo "status=retry" >> "$GITHUB_OUTPUT"
+
+      - name: Re-lanzar workflow si aun no hay capacidad
+        if: steps.deploy.outputs.status == 'retry'
+        run: |
+          echo "Esperando 10 minutos antes de encadenar la siguiente ejecucion..."
+          sleep 600
+          curl --fail -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/hunter.yml/dispatches \
+            -d '{"ref":"main"}'
+          echo "Siguiente corrida encolada."
